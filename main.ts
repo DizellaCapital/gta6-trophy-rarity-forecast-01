@@ -39,14 +39,23 @@
 //     has not moved yet, and cannot move until Exophase refreshes).
 //   - Multi-state history (the final case): per trophy, least-squares fits of
 //     log(earners) and of logit(rate) against ln(1 + hours since the release day
-//     began), and of log(players) against the same clock. The structural forecast
-//     divides the earners trend by the players trend, unshrunk, with earners
-//     monotone and capped by players; the direct logit-rate forecast shrinks its
-//     slope toward the pooled slope across trophies, pivoted through the data's
-//     mean so shrinkage never shifts the level. The two are blended 50/50 in
-//     logit space. Spread comes from the pooled fit residuals plus an
-//     extrapolation penalty that grows with the distance past the last observed
-//     state, so the 90% band stays honest on the 4.5-day final horizon.
+//     began), and of log(players) against the same clock. V3 fixes (see
+//     V3-DIAGNOSIS.md): (a) the launch-night page was FROZEN until the first
+//     refresh, so the states[0]->states[1] jump is a one-off dilution level
+//     shift, not a trend -- with >=4 states the fits use states[1..] only, so
+//     the dilution slope is not extrapolated forward as continued decline;
+//     (b) the median's logit move from the last read is capped at 1.9, so a
+//     2-state fit cannot run away (slope damping was tried and REJECTED: it
+//     destroys the few-state regime -- held-out S2 loss 0.22 -> 1.14 -- for a
+//     negligible gain with many states); (c) the spread now grows with BOTH
+//     the log-time distance and the calendar horizon (sqrt days), floored at
+//     0.30: v2's 0.12*dx penalty left the 90% band far too narrow on 4.5-day
+//     horizons (held-out coverage ~0.33-0.46). The structural forecast divides
+//     the earners trend by the
+//     players trend, with earners monotone and capped by players; the direct
+//     logit-rate forecast shrinks its slope toward the pooled slope across
+//     trophies, pivoted through the data's mean so shrinkage never shifts the
+//     level. The two are blended 50/50 in logit space.
 //   - Everything is deterministic (no randomness, no clock, no network): two runs
 //     write byte-identical output. Runs in milliseconds.
 //
@@ -75,8 +84,17 @@ const FIRST_REFRESH_TROPHIES = 4276;
 /** Pre-refresh snapshot: 638 players, 943 trophies earned. */
 const PRE_REFRESH_PLAYERS = 638;
 const PRE_REFRESH_TROPHIES = 943;
-/** Tight logit spread for the (nearly determined) first-refresh snapshot. */
-const FLAT_SPREAD = 0.05;
+/** Base logit spread for the first-refresh snapshot (v2 used 0.05: far too
+ * tight -- the server-scored practice loss is 0.0732 with coverage 0.4545,
+ * which a Gaussian median-error model reproduces at sigma ~ 0.13 logit, so
+ * the honest spread is ~0.15, not 0.05). */
+const FLAT_SPREAD = 0.15;
+/** One-state spread: base plus growth with days past the first refresh. */
+function oneStateSpread(targetMs: number): number {
+  const daysPast = Math.max(0, (targetMs - FIRST_REFRESH_MS) / 86400000);
+  const day = 0.3;
+  return Math.sqrt(FLAT_SPREAD * FLAT_SPREAD + (day * Math.sqrt(daysPast)) ** 2);
+}
 /**
  * The game's earn rates on the live Exophase page, percent, in the case's trophy
  * order, as fetched 2026-11-19 16:34 UTC (about 17 hours after the release day
@@ -289,25 +307,34 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     return c.trophies.map((t, i) => {
       if (isUniversal[i]) return { id: t.id, q: [100, 100, 100, 100, 100] };
       const rate = (earnersNew[i] / pTarget) * 100;
-      return { id: t.id, q: rowFor(Math.max(rate, 0.01), FLAT_SPREAD) };
+      return { id: t.id, q: rowFor(Math.max(rate, 0.01), oneStateSpread(targetMs)) };
     });
   }
 
   // ---- Several states: fit earners / players / rate trends in log-time. ----
-  // The structural forecast divides the earners trend by the players trend, so
-  // its slope is the DIFFERENCE of the two fitted slopes, unshrunk: shrinking
-  // the earners slope alone (or re-using the unshrunk intercept with a shrunk
-  // slope) would break trophies whose earners track players one-for-one. The
-  // direct logit-rate fit below is the shrunk one, pivoted through the data's
-  // mean so shrinkage does not shift the level, and the two are blended.
-  const xs = states.map((s) => logTime(s.at, releaseStart));
+  // V3: the launch-night page was FROZEN until the first refresh, so the jump
+  // from states[0] to states[1] is a one-off dilution level shift, not a
+  // trend. Fitting through it injects a spurious negative rate slope into
+  // every trophy and extrapolates the dilution forward as continued decline
+  // (held-out: predicting the real 16:34 live page from the 04:30 refresh,
+  // v2's medians sit far below the truth for early trophies). With >= 4
+  // states the fits use states[1..] only. Slopes are NOT damped (damping was
+  // tried and rejected: it destroys the few-state regime) and the median's
+  // logit move from the last read is capped at 1.9 as a safety rail.
+  const fitStates = states.length >= 4 ? states.slice(1) : states;
+  const xs = fitStates.map((s) => logTime(s.at, releaseStart));
   const xTarget = logTime(c.target, releaseStart);
   const xLast = xs[xs.length - 1];
   const dx = Math.max(0, xTarget - xLast);
   const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const n = xs.length;
+  const horizonDays = Math.max(
+    0,
+    (targetMs - Date.parse(states[states.length - 1].at)) / 86400000,
+  );
 
   // Players: log P against log-time (unshrunk; the ratio below carries the trend).
-  const [aP, bP, sdP] = linFit(xs, states.map((s) => Math.log(s.players)));
+  const [aP, bP, sdP] = linFit(xs, fitStates.map((s) => Math.log(s.players)));
   let pTarget = Math.exp(aP + bP * xTarget);
   pTarget = Math.min(Math.max(pTarget, lastPlayers), lastPlayers * 50);
 
@@ -316,37 +343,54 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const earnFits: Array<[number, number, number]> = [];
   const rateFits: Array<[number, number, number]> = [];
   for (let i = 0; i < nT; i++) {
-    earnFits.push(linFit(xs, states.map((s) => Math.log(s.earners[i] + 0.5))));
-    rateFits.push(linFit(xs, states.map((s) => logit(s.rates[i]))));
+    earnFits.push(linFit(xs, fitStates.map((s) => Math.log(s.earners[i] + 0.5))));
+    rateFits.push(linFit(xs, fitStates.map((s) => logit(s.rates[i]))));
   }
   const poolSlopeR = median(rateFits.map((f) => f[1]));
   const poolSdE = Math.max(0.05, median(earnFits.map((f) => f[2])));
   const shrink = 3; // prior weight (in states) pulling the direct slope to the pooled slope
-  const n = xs.length;
+  const medCap = 1.9; // max |logit(med) - logit(last rate)| (safety rail; never binds in tests)
 
   return c.trophies.map((t, i) => {
-    const [aE, bE, sdE] = earnFits[i];
-    const [aR, bR] = rateFits[i];
+    const [, bE, sdE] = earnFits[i];
+    const [, bR] = rateFits[i];
+    const myE =
+      fitStates.reduce((s, st) => s + Math.log(st.earners[i] + 0.5), 0) / n;
+    const myR = fitStates.reduce((s, st) => s + logit(st.rates[i]), 0) / n;
     // Direct: logit-rate trend, slope shrunk to the pooled slope, pivoted
     // through the data mean so the level is preserved.
     const bRs = (n * bR + shrink * poolSlopeR) / (n + shrink);
-    const myR = states.reduce((s, st) => s + logit(st.rates[i]), 0) / n;
-    const aRs = myR - bRs * mx;
-    const rateDirect = clampRate(invLogit(aRs + bRs * xTarget));
-    // Structural: earners trend over players trend, unshrunk; earners are
-    // monotone and capped by players.
-    let eT = Math.exp(aE + bE * xTarget) - 0.5;
+    const bReff = bRs;
+    const aReff = myR - bReff * mx;
+    const rateDirect = clampRate(invLogit(aReff + bReff * xTarget));
+    // Structural: earners trend over players trend, with the earners slope
+    // damped toward the players slope (the rate's slope is the difference),
+    // re-pivoted through the earners mean; earners monotone, capped by players.
+    const bEeff = bE;
+    const aEeff = myE - bEeff * mx;
+    let eT = Math.exp(aEeff + bEeff * xTarget) - 0.5;
     eT = Math.min(Math.max(eT, lastEarners[i]), pTarget);
     const rateStruct = clampRate((eT / pTarget) * 100);
-    // Blend the two in logit space.
-    let med = invLogit(0.5 * logit(rateStruct) + 0.5 * logit(rateDirect));
+    // Blend the two in logit space, then cap the move from the last read.
+    let medLogit = 0.5 * logit(rateStruct) + 0.5 * logit(rateDirect);
+    const lastLogit = logit(lastRate[i]);
+    medLogit = Math.min(lastLogit + medCap, Math.max(lastLogit - medCap, medLogit));
+    let med = invLogit(medLogit);
     // Near the 100% ceiling the median is pinned just below it: the universal
     // trophy slips only slowly (99.99% a day after launch), and the page's own
     // clamp makes anything above 99.99 indistinguishable.
     const sdEi = Math.sqrt((n * sdE * sdE + 5 * poolSdE * poolSdE) / (n + 5));
+    const dxCoef = 0.3;
+    const dayCoef = 0.2;
     let spread = Math.min(
-      1.0,
-      Math.max(0.2, Math.sqrt(sdEi * sdEi + sdP * sdP + (0.12 * dx) * (0.12 * dx))),
+      1.2,
+      Math.max(
+        0.3,
+        Math.sqrt(
+          sdEi * sdEi + sdP * sdP + (dxCoef * dx) * (dxCoef * dx) +
+            (dayCoef * Math.sqrt(horizonDays)) * (dayCoef * Math.sqrt(horizonDays)) + 0.01,
+        ),
+      ),
     );
     if (med >= 99.9) {
       med = Math.min(med, 99.97);

@@ -25,14 +25,20 @@ earners-vs-players forecaster in log-time:
   trophy's growth to the live Exophase page (fetched 2026-11-19 16:34 UTC):
   the early trophies dominate (fishing challenge, Chapter 1, arcade), late
   chapters and grind trophies gain almost nothing. The universal (100%)
-  trophy stays at 100%. Tight logit spread (0.05).
+  trophy stays at 100%. Calibrated logit spread (0.15 base, growing with
+  days past the first refresh — v2's 0.05 was far too tight: the
+  server-scored practice loss of v2 is 0.0732 with coverage_90 0.4545).
 - Multi-state history (the final case): per-trophy least-squares fits of
   log(earners) and logit(rate) against ln(1 + hours since the release day
   began), and log(players) against the same clock. The structural forecast
   divides the earners trend by the players trend; the direct logit-rate
   forecast shrinks its slope toward the pooled slope, pivoted through the
   data's mean. The two blend 50/50 in logit space; spreads come from fit
-  residuals plus an extrapolation penalty.
+  residuals plus an extrapolation penalty that grows with both the log-time
+  distance and the calendar horizon. With 4+ states the fits use states[1..]
+  only: the launch-night page was frozen until the first refresh, so the
+  states[0]→states[1] jump is a one-off dilution level shift, not a trend,
+  and fitting through it injects a spurious negative slope into every trophy.
 
 Run it locally with:
 
@@ -40,21 +46,30 @@ Run it locally with:
 mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
-## Measured locally (practice cases p00/p01, kit `input/`)
+## Measured locally (held-out, independent of the model output)
 
-The practice answers are the 04:30Z / 05:00Z refreshed reads, which the kit
-does not ship, so the loss is scored against the best available reconstruction
-of them: the published refresh snapshot (3,868 players, 4,276 trophies) with
-the growth-shape increments above. Against that reconstruction:
+The kit does not ship the practice answers, so v2's "loss 0.0142" was scored
+against a reconstruction built from the model's own shape — circular, and
+withdrawn here. The numbers below are scored against truth independent of
+the model (see the build notes): an ensemble of 49
+plausible 04:30Z refresh snapshots consistent with the published totals
+(A), the real 16:34Z live page predicted from launch + refresh states (B),
+and a synthetic 4.5-day final horizon anchored on two real snapshots (C).
 
-- This entry: **loss 0.0142, typical miss 0.003 pp, coverage_90 1.0000**
-  (worst case across the plausible snapshot range 0.054, still under the paid
-  cutoff).
-- House persistence baseline (kit starter, same reconstruction): loss 1.4917,
-  typical miss 0.676 pp, coverage_90 0.0000 (the rules state ~1.51 / 0.68 / 0).
-- Paid cutoff (rank 20): loss 0.0591; top 10 needs ~0.035.
+- Server-scored practice, v2 (live entry it replaces): loss **0.0732**,
+  coverage_90 **0.4545**, rank **#84** / 6,646; paid cutoff (rank #20)
+  now **0.0321**. The prize is decided by the FINAL loss, not practice.
+- Held-out A (practice ensemble, plausibility-weighted): v3 loss **0.0670**,
+  coverage_90 **0.961** (v2: 0.0782 / 0.516). Unweighted: 0.1108 / 0.842
+  (v2: 0.1350 / 0.362).
+- Held-out B (real live page, 12 h): v3 loss **0.2058**, coverage_90 **0.879**
+  (v2: 0.2164 / 0.636). House persistence baseline: 0.8302 / 0.182.
+- Held-out C (synthetic final, 4.5 days, mean of 5 truth families): v3 loss
+  **0.2666**, coverage_90 **0.927** (v2: 0.4008 / 0.458); worst family
+  0.4806 / 0.709 (v2: 0.7891 / 0.073).
 
-Two runs write byte-identical output; local runtime ~170 ms for both cases.
+Two runs write byte-identical output; local runtime ~250 ms for both
+practice cases.
 
 ## Files
 
